@@ -1,0 +1,37 @@
+{
+    "$schema": "https://go.kicad.org/pcm/schemas/v1",
+    "name": "BOM2Lib",
+    "description": "Build a project-local KiCad library (symbols, footprints, 3D models) from an EasyEDA BOM",
+    "description_full": "BOM2Lib turns an EasyEDA BOM export (CSV) into a complete, project-local KiCad library.\n\nIt prompts for a project name, extracts all LCSC part numbers from the BOM, downloads CAD data from the public EasyEDA API and writes:\n  - <project>.kicad_sym  (symbols, each pre-linked to its footprint)\n  - <project>.pretty/    (footprints, also referenced via ${KIPRJMOD})\n  - <project>.3dshapes/  (WRL + STEP 3D models)\n  - sym-lib-table / fp-lib-table  (auto-registered for the project)\n  - an optional empty .kicad_pro/.kicad_sch/.kicad_pcb skeleton\n\nIf kicad-cli is available, all files are upgraded/validated into native KiCad format automatically. Re-running with the same BOM is fast: already imported parts are cached and skipped unless Overwrite is checked.\n\nRuns as an Action Plugin: Tools > External Plugins > BOM2Lib (in Pcbnew or Eeschema).\n\nEasyEDA library data remains (c) JLCEDA/EasyEDA and must be attributed when shared. Conversion uses a vendored copy of easyeda2kicad.py (MIT).",
+    "identifier": "com.github.fisika1729.bom2kicad",
+    "type": "plugin",
+    "author": {
+        "name": "fisika1729",
+        "contact": {
+            "web": "https://github.com/fisika1729",
+            "github": "fisika1729"
+        }
+    },
+    "maintainer": {
+        "name": "fisika1729",
+        "contact": {
+            "web": "https://github.com/fisika1729",
+            "github": "fisika1729"
+        }
+    },
+    "license": "MIT",
+    "resources": {
+        "homepage": "https://github.com/fisika1729/bom2kicad"
+    },
+    "versions": [
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "10.0",
+            "download_url": "https://github.com/fisika1729/bom2kicad/releases/download/v1.0.0/bom2kicad-1.0.0-pcm.zip",
+            "download_sha256": "74d0d269c2344da4b5ad31a1ab85085beeedc72636ebe3c33e08187776e4e72b",
+            "download_size": 3331693,
+            "install_size": 9364520
+        }
+    ]
+}
