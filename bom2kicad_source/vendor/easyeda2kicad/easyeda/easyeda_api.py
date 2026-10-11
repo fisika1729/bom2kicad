@@ -38,6 +38,58 @@ def _new_session():
 _new_session()
 
 
+# sleep hook lets the host application (KiCad GUI) slice these backoff
+# waits so its event loop stays alive; defaults to plain blocking sleep
+_SLEEP_HOOK = None
+_CANCEL_CHECK = None
+
+# diagnostics surfaced to the host: 'ok' | 'HTTP <code>' | ...
+_LAST_ERROR_REASON = "ok"
+_last_status_code = None
+
+
+def last_error_reason() -> str:
+    return _LAST_ERROR_REASON
+
+
+def set_last_error_reason(reason: str) -> None:
+    global _LAST_ERROR_REASON
+    _LAST_ERROR_REASON = reason
+
+
+def set_sleep_hook(fn) -> None:
+    global _SLEEP_HOOK
+    _SLEEP_HOOK = fn
+
+
+def set_cancel_check(fn) -> None:
+    """fn() -> True while the host wants to abort the current import."""
+    global _CANCEL_CHECK
+    _CANCEL_CHECK = fn
+
+
+def _perform_sleep(seconds: float) -> bool:
+    """Interruptible backoff sleep. Returns False when cancelled."""
+    if _SLEEP_HOOK is not None:
+        try:
+            result = _SLEEP_HOOK(seconds)
+        except Exception:
+            return True
+        return result is not False
+    end = time.time() + max(seconds, 0.0)
+    while True:
+        if _CANCEL_CHECK is not None:
+            try:
+                if _CANCEL_CHECK():
+                    return False
+            except Exception:
+                pass
+        now = time.time()
+        if now >= end:
+            return True
+        time.sleep(min(0.25, end - now))
+
+
 class EasyedaApi:
     def __init__(self) -> None:
         self.headers = {
@@ -49,26 +101,50 @@ class EasyedaApi:
         }
 
     def get_info_from_easyeda_api(self, lcsc_id: str) -> dict:
+        global _LAST_ERROR_REASON, _last_status_code
         api_response = None
         last_exception = None
-        for delay in [0.5, 2, 30, 65, 65, 65, 65]:
+        _LAST_ERROR_REASON = "ok"
+        _last_status_code = None
+        # stay under the ~15 req/min budget; 403 blocks last ~2 minutes, so a
+        # patient-but-bounded ladder [0.5, 3, 20, 40, 60] (~2 min) usually
+        # outlives one block; after that fail fast (the host pauses once and
+        # reschedules) instead of crawling for minutes per part
+        for delay in [0.5, 3, 20, 40, 60]:
+            if _CANCEL_CHECK is not None:
+                try:
+                    if _CANCEL_CHECK():
+                        logging.warning(
+                            f"EasyEDA import cancelled during backoff ({lcsc_id})"
+                        )
+                        return {}
+                except Exception:
+                    pass
             try:
                 r = _http_get(
                     url=API_ENDPOINT.format(lcsc_id=lcsc_id),
                     headers=self.headers,
                     timeout=60,
                 )
+                _last_status_code = r.status_code
                 if r.status_code == 200 and r.text.strip().startswith("{"):
                     api_response = r.json()
+                    _LAST_ERROR_REASON = "ok"
                     break
-                last_exception = RuntimeError(f"HTTP {r.status_code} from EasyEDA API")
+                _LAST_ERROR_REASON = f"HTTP {r.status_code}"
+                last_exception = RuntimeError(
+                    f"HTTP {r.status_code} from EasyEDA API"
+                )
                 logging.warning(
                     f"EasyEDA API throttled ({r.status_code}), "
                     f"waiting {delay}s before retry {lcsc_id}"
                 )
             except Exception as e:
                 last_exception = e
-            time.sleep(delay + random.uniform(0, delay * 0.2))
+                _LAST_ERROR_REASON = f"network error: {e}"[:120]
+            if not _perform_sleep(delay + random.uniform(0, delay * 0.2)):
+                logging.warning(f"EasyEDA import cancelled during backoff ({lcsc_id})")
+                return {}
         else:
             logging.warning(
                 f"EasyEDA API request failed for {lcsc_id} after retries: "

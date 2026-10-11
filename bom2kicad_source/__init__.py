@@ -23,13 +23,15 @@ if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
 # bundled pure wheels for KiCad's python (requests, pydantic, ...)
+# inserted at the FRONT so the vendored copies win over any conflicting
+# PYTHONPATH entries that KiCad's launcher environment may provide
 SITE_PKG = os.path.join(PLUGIN_DIR, "site-packages")
 if os.path.isdir(SITE_PKG) and SITE_PKG not in sys.path:
-    sys.path.append(SITE_PKG)
+    sys.path.insert(0, SITE_PKG)
 for _pkg in ("requests", "pydantic"):
     try:
         __import__(_pkg)
-    except ImportError:
+    except Exception:
         pass
 
 try:
@@ -54,6 +56,24 @@ def _missing_deps() -> list:
     return missing
 
 
+def current_project() -> tuple:
+    """(name, dir) of the project the editor currently has open.
+
+    Works when the plugin runs inside Pcbnew with a project open: the board's
+    .kicad_pcb file lives inside the project folder. Returns ("", "") for
+    unnamed/standalone boards."""
+    try:
+        board = _pcbnew.GetBoard()
+        fn = board.GetFileName() or ""
+        if fn and os.path.splitext(fn)[1].lower() == ".kicad_pcb":
+            fn = os.path.abspath(fn)
+            name = os.path.splitext(os.path.basename(fn))[0]
+            return name, os.path.dirname(fn)
+    except Exception:
+        pass
+    return "", ""
+
+
 if _HAS_PCBNEW:
 
     class Bom2LibPlugin(_PLUGIN_BASE):
@@ -75,7 +95,8 @@ if _HAS_PCBNEW:
             try:
                 from bom2kicad_gui import run_dialog
 
-                run_dialog()
+                name, pdir = current_project()
+                run_dialog(project_name=name, project_dir=pdir)
             except Exception:
                 import logging
                 import traceback

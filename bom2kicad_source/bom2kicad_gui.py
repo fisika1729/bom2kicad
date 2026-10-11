@@ -1,9 +1,15 @@
 """wx dialog for the BOM2Lib plugin."""
 
+import logging
 import os
+import subprocess
+import sys
+import threading
+import traceback
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PARENT = os.path.join(os.path.expanduser("~"), "Documents", "KiCad")
+SITE_PKG = os.path.join(PLUGIN_DIR, "site-packages")
 
 WILDCARD = "EasyEDA BOM (*.csv)|*.csv;*.CSV|All files (*.*)|*.*"
 
@@ -18,8 +24,202 @@ def default_project_name(bom_path: str) -> str:
     return stem.strip("_") or "Project"
 
 
+def check_missing() -> list:
+    """Third-party modules BOM2Lib needs that are absent right now.
+
+    The plugin pushes its bundled site-packages to the FRONT of sys.path
+    (see __init__). Probing imports inside the KiCad process inherits
+    whatever PYTHON* env the AppRun set, so if a PYTHONPATH-loaded copy of
+    pydantic with a mismatched pydantic_core exists, it gets shadowed."""
+    missing = []
+    import importlib
+
+    importlib.invalidate_caches()
+    if SITE_PKG not in sys.path:
+        sys.path.insert(0, SITE_PKG)
+    for mod in ("requests", "pydantic"):
+        try:
+            __import__(mod)
+        except Exception as e:
+            import logging
+
+            logging.exception("check_missing import failed for %s", mod)
+            missing.append(mod)
+    return missing
+
+
+def _manual_install_message(missing) -> str:
+    mods = " ".join(missing)
+    site = SITE_PKG
+    return (
+        "BOM2Lib needs missing Python package(s):\n"
+        "    " + ", ".join(missing) + "\n\n"
+        "KiCad's bundled Python cannot run pip itself (it ships without pip/ssl),\n"
+        "so install into BOM2Lib's own package folder from any Python that HAS pip:\n\n"
+        f'    python3 -m pip install --only-binary=:all: --implementation cp '
+        f'--python-version 3.11 --abi cp311 \\\n'
+        f'        --platform manylinux2014_x86_64 --platform manylinux_2_28_x86_64 '
+        f'--platform manylinux_2_17_x86_64 \\\n'
+        f'        --target "{site}" {mods}\n\n'
+        "(matches KiCad's bundled CPython 3.11; the plugin folder becomes "
+        "self-contained again). After installing, restart KiCad and run BOM2Lib."
+    )
+
+
+def _clean_env() -> dict:
+    """Environment for child processes: drop PYTHON* leftovers that KiCad's
+    AppRun may set, otherwise spawned host pythons inherit a poisoned
+    search path and even `pip` fails to start."""
+    return {
+        k: v for k, v in os.environ.items()
+        if not k.upper().startswith("PYTHON")
+    }
+
+
+def _pip_probe(python: str) -> bool:
+    cmd = [python, "-m", "pip", "--version"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                           env=_clean_env())
+        return r.returncode == 0 and "pip" in (r.stdout or "").lower()
+    except Exception:
+        return False
+
+
+def _pip_install_cmd(python: str, mods: list) -> list:
+    import platform
+
+    cmd = [python, "-m", "pip", "install", "--no-warn-script-location",
+           "--upgrade", "--target", SITE_PKG, "--only-binary=:all:"]
+    if platform.system() == "Linux":
+        # target KiCad's bundled CPython 3.11 ABI regardless of host python
+        cmd += ["--implementation", "cp", "--python-version", "3.11",
+                "--abi", "cp311"]
+        for plat in ("manylinux2014_x86_64", "manylinux_2_28_x86_64",
+                     "manylinux_2_17_x86_64"):
+            cmd += ["--platform", plat]
+    return cmd + mods
+
+
+def _host_pips() -> list:
+    import shutil as _shutil
+
+    out = []
+    seen = set()
+    cands = [sys.executable, "python3", "python3.11"]
+    for c in cands:
+        path = c if os.path.isabs(c) else (_shutil.which(c) or "")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if _pip_probe(path):
+            out.append(path)
+    return out
+
+
+def _install_for_me(parent, missing) -> str:
+    """Install missing packages into the plugin folder using a host pip.
+
+    KiCad's own bundled Python has neither pip nor ssl, so we ask the system
+    Python to install version-matched wheels (--python-version 3.11 --abi
+    cp311 on Linux) with --target into the plugin's site-packages."""
+    import wx
+    import importlib
+
+    hosts = _host_pips()
+    if not hosts:
+        return (
+            "Could not find a Python with pip on this machine "
+            "(KiCad's bundled Python has no pip).\n\n"
+            + _manual_install_message(missing)
+        )
+
+    prog = wx.ProgressDialog(
+        "BOM2Lib - installing packages",
+        f"Installing {', '.join(missing)} via pip...",
+        maximum=100,
+        parent=parent,
+        style=wx.PD_APP_MODAL | wx.PD_ELAPSED_TIME,
+    )
+    _pump_events()
+    clean = _clean_env()
+    try:
+        logs = []
+        ok = False
+        for host in hosts:
+            cmd = _pip_install_cmd(host, missing)
+            logs.append("$ " + " ".join(cmd))
+            _pump_events()
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200,
+                               env=clean)
+            if r.stdout:
+                logs.append((r.stdout or "").strip()[-400:])
+            if r.stderr:
+                logs.append((r.stderr or "").strip()[-400:])
+            if r.returncode == 0:
+                importlib.invalidate_caches()
+                still = check_missing()
+                if not still:
+                    ok = True
+                    break
+        prog.Destroy()
+        _pump_events()
+        if ok:
+            return "ok"
+        return "\n".join(logs)[-900:] + "\n\n" + _manual_install_message(missing)
+    except Exception as e:
+        try:
+            prog.Destroy()
+        except Exception:
+            pass
+        _pump_events()
+        return f"Automatic install failed: {e}\n\n" + _manual_install_message(missing)
+
+
+def prompt_missing_packages(parent=None):
+    """If dependencies are missing, offer Yes (auto-install) / No (manual
+    instructions). Returns True when the main dialog may be shown."""
+    import wx
+
+    missing = check_missing()
+    if not missing:
+        return True
+
+    mods = ", ".join(missing)
+    dlg = wx.MessageDialog(
+        parent,
+        f"BOM2Lib needs {mods} which are not installed.\n\n"
+        "Do you want me to install them automatically for you?",
+        "BOM2Lib - missing packages",
+        wx.ICON_QUESTION | wx.YES_NO,
+    )
+    try:
+        answer = dlg.ShowModal()
+    finally:
+        dlg.Destroy()
+
+    if answer == wx.ID_YES:
+        result = _install_for_me(parent, missing)
+        if result == "ok":
+            wx.MessageBox(
+                "Packages installed successfully. Starting BOM2Lib...",
+                "BOM2Lib", wx.OK | wx.ICON_INFORMATION,
+            )
+            return prompt_missing_packages(parent)
+        wx.MessageBox(result, "BOM2Lib - install needed", wx.OK | wx.ICON_ERROR)
+        return False
+
+    # No -> leave a reminder of what to install and how
+    wx.MessageBox(
+        _manual_install_message(missing),
+        "BOM2Lib - installation required",
+        wx.OK | wx.ICON_INFORMATION,
+    )
+    return False
+
+
 def run_build(bom_path, project_name, parent_dir, with_3d, with_step, overwrite,
-              skeleton, log_cb, progress_cb):
+              skeleton, log_cb, progress_cb, pump_cb=None, cancel_event=None):
     """Import shim so the dialog does not import core until needed."""
     from core import build_libraries
 
@@ -33,56 +233,68 @@ def run_build(bom_path, project_name, parent_dir, with_3d, with_step, overwrite,
         skeleton=skeleton,
         log_cb=log_cb,
         progress_cb=progress_cb,
+        pump_cb=pump_cb,
+        cancel_event=cancel_event,
     )
 
 
-class Bom2LibDialog(object):
-    pass
-
-
 def _pump_events():
+    """Keeps the dialog responsive WITHOUT a nested event loop.
+
+    wx.App.Yield from inside a modal handler in KiCad's embedded wx tends to
+    hit the recursion guard and silently abort, so the gauge/log repaints get
+    swallowed - use ProcessPendingEvents + explicit widget updates instead."""
     import wx
 
     try:
         if wx.GetApp() is not None:
-            wx.GetApp().Yield(True)
+            wx.GetApp().ProcessPendingEvents()
     except Exception:
         pass
 
 
-def run_dialog(parent=None):
+def run_dialog(parent=None, project_name="", project_dir=""):
     import wx
 
-    dlg = Bom2LibDialog(parent)
+    if not prompt_missing_packages(parent):
+        return
+    dlg = Bom2LibDialog(parent, project_name=project_name, project_dir=project_dir)
     try:
         dlg.ShowModal()
     finally:
         dlg.Destroy()
 
 
+class Bom2LibDialog(object):
+    pass
+
+
 try:
     import wx
 
     class Bom2LibDialog(wx.Dialog):
-        def __init__(self, parent=None):
+        def __init__(self, parent=None, project_name="", project_dir=""):
             wx.Dialog.__init__(
                 self,
                 parent,
                 title="BOM2Lib - EasyEDA BOM to KiCad project library",
-                size=(660, 620),
+                size=(660, 640),
             )
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
 
-            info = wx.StaticText(
-                panel,
-                label=(
-                    "Builds a project-local KiCad library from an EasyEDA BOM export.\n"
-                    "Every LCSC part number in the BOM gets its symbol, footprint and\n"
-                    "3D model downloaded from EasyEDA and added to one library."
-                ),
-            )
+            has_project = bool(project_name and project_dir)
+            top_label = "Running against the project you have open:" \
+                if has_project else \
+                "Builds a project-local KiCad library from an EasyEDA BOM export."
+            info = wx.StaticText(panel, label=top_label)
             vbox.Add(info, 0, wx.ALL, 10)
+            if has_project:
+                info2 = wx.StaticText(
+                    panel,
+                    label=f"    {os.path.join(project_dir, project_name)}.kicad_pro",
+                )
+                vbox.Add(info2, 0, wx.LEFT | wx.BOTTOM, 10)
 
             grid = wx.FlexGridSizer(3, 2, 8, 8)
             grid.AddGrowableCol(1, 1)
@@ -91,7 +303,7 @@ try:
                 0,
                 wx.ALIGN_CENTER_VERTICAL,
             )
-            self.name_ctrl = wx.TextCtrl(panel, value="")
+            self.name_ctrl = wx.TextCtrl(panel, value=project_name or "")
             grid.Add(self.name_ctrl, 1, wx.EXPAND)
 
             grid.Add(
@@ -110,10 +322,18 @@ try:
                 wx.ALIGN_CENTER_VERTICAL,
             )
             self.dir_picker = wx.DirPickerCtrl(
-                panel, path=DEFAULT_PARENT, style=wx.DIRP_USE_TEXTCTRL
+                panel,
+                path=project_dir or DEFAULT_PARENT,
+                style=wx.DIRP_USE_TEXTCTRL,
             )
             grid.Add(self.dir_picker, 1, wx.EXPAND)
             vbox.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+            if has_project:
+                keep = wx.CheckBox(panel, label="Keep these name/folder (use the open project)")
+                keep.SetValue(True)
+                self.keep_proj = keep
+                vbox.Add(keep, 0, wx.LEFT | wx.RIGHT, 10)
 
             opts = wx.BoxSizer(wx.HORIZONTAL)
             self.chk_3d = wx.CheckBox(panel, label="3D models")
@@ -127,8 +347,14 @@ try:
                 opts.Add(c, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
             vbox.Add(opts, 0, wx.ALL, 10)
 
+            btn_row = wx.BoxSizer(wx.HORIZONTAL)
             self.import_btn = wx.Button(panel, label="Build library")
-            vbox.Add(self.import_btn, 0, wx.ALIGN_CENTER | wx.BOTTOM, 8)
+            btn_row.Add(self.import_btn, 0, wx.RIGHT, 12)
+            self.stop_btn = wx.Button(panel, label="Stop")
+            self.stop_btn.Disable()
+            btn_row.Add(self.stop_btn, 0, wx.RIGHT, 12)
+            btn_row.AddStretchSpacer()
+            vbox.Add(btn_row, 0, wx.EXPAND | wx.ALL, 10)
 
             self.gauge = wx.Gauge(panel, range=1, style=wx.GA_SMOOTH)
             vbox.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -143,13 +369,64 @@ try:
 
             panel.SetSizer(vbox)
 
+            self._thread = None
+            self._cancel = None
+            self._running = False
+            self.close_btn = close_btn
+
             self.bom_picker.Bind(wx.EVT_FILEPICKER_CHANGED, self.on_bom_changed)
             self.import_btn.Bind(wx.EVT_BUTTON, self.on_import)
-            close_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CANCEL))
+            self.stop_btn.Bind(wx.EVT_BUTTON, self.on_stop)
+            close_btn.Bind(wx.EVT_BUTTON, self.on_close_clicked)
+            self.Bind(wx.EVT_CLOSE, self.on_window_close)
+
+        # ------------------------------------------------- run / stop plumbing
+        def _busy(self) -> bool:
+            return self._running and self._thread is not None \
+                and self._thread.is_alive()
+
+        def on_close_clicked(self, evt):
+            if self._busy():
+                self._ask_stop()
+                return
+            self.EndModal(wx.ID_CANCEL)
+
+        def on_window_close(self, evt):
+            if self._busy():
+                self._ask_stop()
+                evt.Veto()
+                return
+            evt.Skip()
+
+        def on_stop(self, evt):
+            self._ask_stop()
+
+        def _ask_stop(self):
+            import wx
+
+            if not self._busy():
+                return
+            if self._cancel is not None and self._cancel.is_set():
+                return
+            dlg = wx.MessageDialog(
+                self,
+                "Interrupt the BOM import?\n\nAlready imported parts remain in "
+                "the library; the cache lets you resume later exactly where "
+                "you stopped.",
+                "BOM2Lib - interrupt?",
+                wx.ICON_QUESTION | wx.YES_NO,
+            )
+            try:
+                if dlg.ShowModal() == wx.ID_YES:
+                    self._cancel.set()
+                    self.log("Stop requested - finishing current part, "
+                             "then interrupting...")
+            finally:
+                dlg.Destroy()
 
         def on_bom_changed(self, evt):
             path = self.bom_picker.GetPath()
-            if path and os.path.isfile(path):
+            if path and os.path.isfile(path) and not self.name_ctrl.GetValue().strip():
                 self.name_ctrl.SetValue(default_project_name(path))
 
         def on_import(self, evt):
@@ -179,49 +456,116 @@ try:
                 return
 
             self.import_btn.Disable()
+            self.stop_btn.Enable()
             self.gauge.SetRange(1)
             self.gauge.SetValue(0)
+            self._cancel = threading.Event()
+            self._running = True
+            self.log("Starting build in the background...")
+
+            args = (
+                bom, project_name, parent,
+                self.chk_3d.GetValue(), self.chk_step.GetValue(),
+                self.chk_overwrite.GetValue(), self.chk_skeleton.GetValue(),
+            )
+            self._thread = threading.Thread(
+                target=self._build_worker, args=args, daemon=True
+            )
+            self._thread.start()
+
+        def _build_worker(self, bom, project_name, parent, with_3d, with_step,
+                          overwrite, skeleton):
+            """Runs in a background thread; all GUI interaction goes through
+            wx.CallAfter so updates paint reliably from KiCad's event loop."""
+            import traceback as _tb
+
+            log_cb = lambda msg: wx.CallAfter(self.log, msg)
+            progress_cb = lambda done, total: wx.CallAfter(
+                self.progress, done, total
+            )
             try:
                 summary = run_build(
                     bom_path=bom,
                     project_name=project_name,
                     parent_dir=parent,
-                    with_3d=self.chk_3d.GetValue(),
-                    with_step=self.chk_step.GetValue(),
-                    overwrite=self.chk_overwrite.GetValue(),
-                    skeleton=self.chk_skeleton.GetValue(),
-                    log_cb=self.log,
-                    progress_cb=self.progress,
+                    with_3d=with_3d,
+                    with_step=with_step,
+                    overwrite=overwrite,
+                    skeleton=skeleton,
+                    log_cb=log_cb,
+                    progress_cb=progress_cb,
+                    cancel_event=self._cancel,
                 )
+                wx.CallAfter(self._build_done, summary, None)
             except Exception as e:
-                self.log(f"FATAL: {e}")
+                wx.CallAfter(self._build_done, None, e)
+                logging.exception("BOM2Lib worker failed")
+            finally:
+                wx.CallAfter(self._worker_finished)
+
+        def _worker_finished(self):
+            self._running = False
+            self.stop_btn.Disable()
+
+        def _build_done(self, summary, exc):
+            if exc is not None:
+                err = "".join(traceback.format_exception(
+                    type(exc), exc, exc.__traceback__))[-1500:]
+                self.log("FATAL: %s" % exc)
                 wx.MessageBox(
-                    f"BOM2Lib failed:\n{e}", "BOM2Lib error", wx.OK | wx.ICON_ERROR
+                    "BOM2Lib failed:\n%s" % err,
+                    "BOM2Lib error", wx.OK | wx.ICON_ERROR,
+                )
+                self.import_btn.Enable()
+                return
+
+            if summary.get("cancelled"):
+                self.log("Build interrupted by user - resume anytime with "
+                         "the same BOM and project name.")
+                wx.MessageBox(
+                    "Import interrupted.\n\n"
+                    "Parts already fetched are stored (cache) in the project "
+                    "folder - run the same BOM + project name again to resume "
+                    "from where you stopped.",
+                    "BOM2Lib", wx.OK | wx.ICON_INFORMATION,
                 )
                 self.import_btn.Enable()
                 return
 
             failed = summary.get("failed", [])
             msg = (
-                f"Library built in:\n{summary['project_dir']}\n\n"
-                f"Parts OK: {len(summary['ok'])}"
-                f" ({len(summary['cached'])} already present), failed: {len(failed)}"
+                "Library built in:\n%s\n\nParts OK: %d (%d already present), "
+                "failed: %d" % (
+                    summary["project_dir"], len(summary["ok"]),
+                    len(summary["cached"]), len(failed),
+                )
             )
             if failed:
                 msg += "\n\nFailed parts:\n" + "\n".join(
                     f"  {lcsc}: {err}" for lcsc, err in failed[:20]
                 )
+            msg += (
+                "\n\nTip: fully close and reopen this project (or restart "
+                "KiCad) so its editors pick up the freshly written "
+                "sym-lib-table / fp-lib-table."
+            )
             wx.MessageBox(msg, "BOM2Lib", wx.OK | wx.ICON_INFORMATION)
             self.import_btn.Enable()
 
         def log(self, msg):
             self.log_ctrl.AppendText(msg + "\n")
-            _pump_events()
+            try:
+                self.log_ctrl.Update()
+            except Exception:
+                pass
 
         def progress(self, done, total):
             self.gauge.SetRange(max(total, 1))
             self.gauge.SetValue(done)
-            _pump_events()
+            try:
+                self.gauge.Update()
+            except Exception:
+                pass
 
 except ImportError:
     # wx not available (e.g. headless testing of core logic only)

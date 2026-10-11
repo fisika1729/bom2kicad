@@ -77,9 +77,7 @@ python3 core.py --bom BOM_xxx.csv --name MyProject --out ~/Documents/KiCad
 - **Bundled dependencies** (`site-packages/`): `requests`, `pydantic` and friends
   ship inside the package, so no pip installs are needed in KiCad's Python.
   The `pydantic_core` wheel targets CPython 3.11, which is what KiCad 10
-  bundles (minimum tested version). The conversion layer itself is a vendored
-  copy of [easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py) (MIT),
-  patched for a current User-Agent and request patience.
+  bundles (minimum tested version).
 - **EasyEDA rate limiting**: the API allows roughly ~15 requests/minute.
   The plugin paces requests (~4 s apart) and automatically waits out HTTP 403
   blocks, so a 50-part BOM takes a few minutes — progress is shown in the
@@ -102,3 +100,33 @@ package and submitting to the official KiCad addon repository
 - Map BOM designators onto placed symbols to pre-populate the schematic
 - Optional "update library" pass that checks for newer part revisions
 - Per-part exclusion flags for BOM-fitted vs personally selected alternatives
+
+## Credits
+
+All the heavy lifting — EasyEDA API access, symbol/footprint/3D model parsing
+and the KiCad library exporters — comes from
+**[easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py)** by
+[uPesy Electronics](https://www.upesy.com/) (MIT license). A vendored copy
+ships in `vendor/easyeda2kicad/` with its MIT license text preserved at
+`vendor/easyeda2kicad/LICENSE`. If this plugin saves you time, go star/
+support the original project — without it, BOM2Lib would not exist.
+
+What BOM2Lib itself adds:
+
+- BOM parsing (UTF-16/UTF-8, tab/comma) and LCSC part-number extraction
+- Batch import loop with progress, caching and per-part error recovery
+- Project-scoped library layout + `sym-lib-table` / `fp-lib-table` generation
+- `${KIPRJMOD}`-relative 3D model references and empty project skeletons
+- Fixes to the vendored converter: current User-Agent (the old one gets
+  blocked by the API), retry/backoff with timeouts, and a 3D-model export
+  path fix
+
+## Acknowledgements
+
+- [easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py) by uPesy (MIT) —
+  the conversion engine this plugin runs on
+- [pydantic](https://docs.pydantic.dev/) (MIT) and
+  [requests](https://requests.readthedocs.io/) (Apache-2.0), bundled in
+  `site-packages/`
+- EasyEDA/LCSC for providing public CAD data of their official component
+  library

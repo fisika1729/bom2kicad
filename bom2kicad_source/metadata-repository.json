@@ -25,13 +25,13 @@
     },
     "versions": [
         {
-            "version": "1.0.0",
+            "version": "1.0.1",
             "status": "stable",
             "kicad_version": "10.0",
-            "download_url": "https://github.com/fisika1729/bom2kicad/releases/download/v1.0.0/bom2kicad-1.0.0-pcm.zip",
-            "download_sha256": "74d0d269c2344da4b5ad31a1ab85085beeedc72636ebe3c33e08187776e4e72b",
-            "download_size": 3331693,
-            "install_size": 9364520
+            "download_url": "https://github.com/fisika1729/bom2kicad/releases/download/v1.0.1/bom2kicad-1.0.1-pcm.zip",
+            "download_sha256": "cad4a1d570516407238e899bf57f9b8a807b6449a96dbb41ee7e99d9bb4fb19d",
+            "download_size": 3354399,
+            "install_size": 9476700
         }
     ]
 }

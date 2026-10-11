@@ -17,7 +17,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_VERSION = "1.0.0"
+PACKAGE_VERSION = "1.0.1"
 
 METADATA = {
     "$schema": "https://go.kicad.org/pcm/schemas/v1",
