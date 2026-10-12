@@ -98,14 +98,21 @@ def build(out_path: str) -> str:
         full = os.path.join(HERE, entry)
         if _excluded(entry, full) or entry.startswith(
             ("build_pcm", "LICENSE")
-        ) or entry in ("metadata.json", "README_PUBLISHING.md", "icon_pcm.png"):
+        ) or entry in ("metadata.json", "README.md", "README_PUBLISHING.md",
+                       "icon_pcm.png"):
+            # README.md is injected from the repo root below (single source)
             continue
-        # build scripts and the metadata template stay out of the payload
-        shutil.move if False else None
         if os.path.isdir(full):
             shutil.copytree(full, os.path.join(payload_root, entry))
         else:
             shutil.copy2(full, payload_root)
+
+    # single README: the repo-root README doubles as the in-plugin doc
+    root_readme = os.path.join(os.path.dirname(HERE), "README.md")
+    local_readme = os.path.join(HERE, "README.md")
+    src_readme = root_readme if os.path.isfile(root_readme) else local_readme
+    if os.path.isfile(src_readme):
+        shutil.copy2(src_readme, os.path.join(payload_root, "README.md"))
 
     # clean junk from the payload copy
     for root, dirs, files in os.walk(payload_root):

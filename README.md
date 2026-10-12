@@ -8,6 +8,10 @@ BOM export (CSV). Instead of copy-pasting LCSC part numbers into easyeda2kicad
 one by one, pick the BOM, type a project name and every part — symbol, footprint
 and 3D model — is downloaded into one library owned by the project.
 
+Needed from EasyEDA: export your project's **BOM as CSV** (the `Supplier Part`
+column holds the LCSC part number, e.g. `C476766` — that is all the plugin
+needs to look the part up).
+
 ## Install
 
 **From file (PCM):** download `bom2kicad-<version>-pcm.zip` from
@@ -17,73 +21,125 @@ and 3D model — is downloaded into one library owned by the project.
 **Build the zip yourself:**
 
 ```
-python3 build_pcm.py out/bom2kicad-1.0.0-pcm.zip
+python3 build_pcm.py out/bom2kicad-1.0.1-pcm.zip
 ```
 
 > If you also copied the plugin into `scripting/plugins/` manually, delete that
 > copy before installing via PCM, otherwise the menu shows duplicate entries.
 
-## What it does
+> Restart KiCad after installing — plugins are discovered at startup.
 
-1. Shows a dialog prompting for a **project name** and the **EasyEDA BOM file**.
-2. Parses the BOM (handles UTF-16 / UTF-8, tab or comma separated) and extracts
-   all unique **LCSC part numbers** (Supplier Part column).
-3. For each part, downloads CAD data from the public EasyEDA API and generates:
-   - **Symbol** → `<parent>/<project>/<project>.kicad_sym`
-   - **Footprint** → `<parent>/<project>/<project>.pretty/<name>.kicad_mod`
-   - **3D model** (optional) → `<parent>/<project>/<project>.3dshapes/*.wrl|.step`
-4. Symbols automatically reference the matching footprint
-   (`<project>:<footprint>`), and footprints reference their 3D model via
-   `${KIPRJMOD}` — so the whole library moves with the project folder.
-5. Creates project library tables (`sym-lib-table`, `fp-lib-table`) so the
-   library is auto-registered for any KiCad project opened in that folder.
-6. Optionally creates an empty KiCad project skeleton
-   (`.kicad_pro`, `.kicad_sch`, `.kicad_pcb`) so you can open it right away.
-7. If `kicad-cli` is available (including inside the KiCad AppImage), the
-   libraries are upgraded/validated into native KiCad 10 format automatically.
+## Step-by-step usage (from an empty project to a full library)
 
-Resulting folder layout:
+**1. Create the project**
+
+- Launch KiCad (AppImage → project manager).
+- **File → New Project...** → give it a name (e.g. `test`) and location
+  (e.g. `~/Documents/KiCad` — any folder works). KiCad creates:
+
+  ```
+  ~/Documents/KiCad/test/
+  ├── test.kicad_pro
+  ├── test.kicad_sch
+  └── test.kicad_pcb
+  ```
+
+**2. Open the PCB editor**
+
+- In the project manager click **PCB Editor**.
+  (The plugin menu only exists in the PCB editor — the schematic editor and
+  the launcher have no External Plugins menu.)
+
+**3. Run the plugin**
+
+- Menu: **Tools → External Plugins → BOM2Lib: create project library from
+  EasyEDA BOM** (or the toolbar button).
+- The dialog detects the project you have open and pre-fills:
+
+  | Field | What to enter |
+  |---|---|
+  | Project name | auto-filled from your open project (`test`) — leave it so the library lands inside that project |
+  | EasyEDA BOM (CSV) | pick the exported BOM file |
+  | Create in (parent folder) | the project folder itself (`~/Documents/KiCad/test`) **or** its parent (`~/Documents/KiCad`) — both resolve into the project folder |
+  | 3D models / STEP files | keep on (recommended) |
+  | Project skeleton | only newly created folders get empty `.kicad_pro/.kicad_sch/.kicad_pcb`; existing project files are never touched |
+  | Overwrite | re-fetch parts already in the library |
+
+- Click **Build library**. The import runs in the background — the gauge and
+  the log update per part. Expect **~4 s per part** (EasyEDA rate-limits to
+  roughly 15 requests/minute). A 50-part BOM takes a few minutes; see
+  [Troubleshooting](#troubleshooting) for the 403-throttle behavior.
+
+- **Stop** button: interrupts the run at any time (confirmation dialog).
+  Parts already downloaded are cached in the project folder
+  (`.bom2kicad_cache.json`) — run the same BOM + project name again to resume
+  exactly where it stopped.
+
+**4. Reload and design**
+
+- When the build finishes you get a summary (parts OK / failed / already
+  present). **Close and reopen the project** (or restart KiCad) — KiCad reads
+  project library tables only at project open.
+- Reopen the project: the `test` library is registered automatically via the
+  project-local `sym-lib-table` / `fp-lib-table` written next to
+  `test.kicad_pro`.
+- Place symbols in the schematic (`A` → search parts from the `test`
+  library). Each symbol already carries Value / Footprint / Datasheet /
+  LCSC Part fields, and points at `test:<footprint>`; footprints and 3D
+  models resolve through `${KIPRJMOD}` — the whole project folder is portable
+  (zip it, share it, it works).
+
+Resulting project layout:
 
 ```
-~/Documents/KiCad/MyProject/
-├── MyProject.kicad_pro / .kicad_sch / .kicad_pcb   (empty skeleton)
-├── MyProject.kicad_sym
-├── MyProject.pretty/                          (footprints)
-├── MyProject.3dshapes/                        (wrl + step)
-├── sym-lib-table / fp-lib-table               (auto-registered)
-└── MyProject_bom_import.csv                    (BOM copy for reference)
+~/Documents/KiCad/test/
+├── test.kicad_pro / .kicad_sch / .kicad_pcb     (your project - untouched)
+├── test.kicad_sym                               (project symbols)
+├── test.pretty/                                 (project footprints)
+├── test.3dshapes/                               (wrl + step)
+├── sym-lib-table / fp-lib-table                 (auto-registered)
+├── test_bom_import.csv                          (BOM copy for reference)
+└── .bom2kicad_cache.json                        (resume cache)
 ```
-
-## Usage
-
-- Pcbnew (or Eeschema) → **Tools → External Plugins → BOM2Lib**
-  (or click the toolbar button).
-- Enter a project name (auto-filled from the BOM filename), pick the BOM CSV,
-  pick the parent folder (default `~/Documents/KiCad`), hit **Build library**.
-- When done, open `<parent>/<project>/<project>.kicad_pro` in KiCad and place
-  symbols from the `<project>` library — footprints and 3D models follow
-  automatically.
 
 ## Command line (headless)
 
-The core also works without KiCad:
+The core also works without KiCad (faster, no rate-limit UI caps):
 
 ```
 python3 core.py --bom BOM_xxx.csv --name MyProject --out ~/Documents/KiCad
 ```
 
+## Troubleshooting
+
+- **"Could not connect... SSL module is not available"** — normal with the
+  KiCad AppImage: its bundled Python has no `ssl` module. The plugin detects
+  this and routes all EasyEDA downloads through your system Python
+  automatically; conversion still happens inside KiCad.
+- **`HTTP 403` / "EasyEDA is rate-limiting this connection"** — you hit the
+  per-minute request cap. The build parks for 60 s once, then fails
+  remaining parts fast with the honest reason. Wait a few minutes and run
+  the same BOM again — cached parts are skipped instantly and only the
+  missing ones download.
+- **"The current configuration does not include the symbol library ..."** —
+  the project lib tables are written/updated *while the project is open*,
+  but KiCad loads them only at project open. Fully close the project
+  (or restart KiCad) and reopen — nothing else needed.
+- **Missing packages (pydantic / requests) prompt** — choose **Yes** to let
+  the plugin install them into its own folder using your system Python, or
+  **No** to get the exact manual command. Restart KiCad afterwards.
+- **Two BOM2Lib entries in the menu** — you have the manual copy AND the PCM
+  copy installed; delete the manual one
+  (`~/.local/share/kicad/10.0/scripting/plugins/bom2kicad`) and restart.
+
 ## Notes
 
-- **Bundled dependencies** (`site-packages/`): `requests`, `pydantic` and friends
-  ship inside the package, so no pip installs are needed in KiCad's Python.
-  The `pydantic_core` wheel targets CPython 3.11, which is what KiCad 10
-  bundles (minimum tested version).
-- **EasyEDA rate limiting**: the API allows roughly ~15 requests/minute.
-  The plugin paces requests (~4 s apart) and automatically waits out HTTP 403
-  blocks, so a 50-part BOM takes a few minutes — progress is shown in the
-  dialog. Big BOMs may be safer to import in one pass and let the cache
-  resume on failure: parts already imported are cached in
-  `.bom2kicad_cache.json` and skipped on re-runs unless *Overwrite* is checked.
+- **Bundled dependencies** (`site-packages/`): `requests`, `pydantic` and
+  friends ship inside the package. The `pydantic_core` wheel targets
+  CPython 3.11, which is what KiCad 10 bundles (minimum tested version).
+  The conversion layer is a vendored copy of
+  [easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py) (MIT),
+  patched for a current User-Agent, request patience and AppImage workarounds.
 - **Licensing**: symbols, footprints and 3D models come from the
   EasyEDA/LCSC official library and remain (C) JLCEDA/EasyEDA — attribute
   them when sharing; use in your own commercial designs is allowed. Plugin
@@ -91,15 +147,9 @@ python3 core.py --bom BOM_xxx.csv --name MyProject --out ~/Documents/KiCad
 
 ## Publishing
 
-See [README_PUBLISHING.md](README_PUBLISHING.md) for rebuilding the PCM
-package and submitting to the official KiCad addon repository
-(package id `com.github.fisika1729.bom2kicad`).
-
-## Roadmap / ideas
-
-- Map BOM designators onto placed symbols to pre-populate the schematic
-- Optional "update library" pass that checks for newer part revisions
-- Per-part exclusion flags for BOM-fitted vs personally selected alternatives
+See [bom2kicad_source/README_PUBLISHING.md](bom2kicad_source/README_PUBLISHING.md)
+for rebuilding the PCM package and submitting to the official KiCad addon
+repository (package id `com.github.fisika1729.bom2kicad`).
 
 ## Credits
 
@@ -107,19 +157,36 @@ All the heavy lifting — EasyEDA API access, symbol/footprint/3D model parsing
 and the KiCad library exporters — comes from
 **[easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py)** by
 [uPesy Electronics](https://www.upesy.com/) (MIT license). A vendored copy
-ships in `vendor/easyeda2kicad/` with its MIT license text preserved at
-`vendor/easyeda2kicad/LICENSE`. If this plugin saves you time, go star/
-support the original project — without it, BOM2Lib would not exist.
+ships in `bom2kicad_source/vendor/easyeda2kicad/` with its MIT license text
+preserved at `vendor/easyeda2kicad/LICENSE`. If this plugin saves you time,
+go star/support the original project — without it, BOM2Lib would not exist.
 
 What BOM2Lib itself adds:
 
 - BOM parsing (UTF-16/UTF-8, tab/comma) and LCSC part-number extraction
-- Batch import loop with progress, caching and per-part error recovery
+- Batch import loop with progress, caching, per-part error recovery and a
+  worker thread with Stop/interrupt support
 - Project-scoped library layout + `sym-lib-table` / `fp-lib-table` generation
+- SSL-less AppImage bridge (fetches via the system Python when needed)
 - `${KIPRJMOD}`-relative 3D model references and empty project skeletons
 - Fixes to the vendored converter: current User-Agent (the old one gets
   blocked by the API), retry/backoff with timeouts, and a 3D-model export
   path fix
+
+## Next version (2.0) — schematic import from foreign EDA tools
+
+`bom2kicad_next/` (kept out of this repo for now, lives one folder up in the
+working tree) extends the idea: feed it the **netlist/schematic** of a design
+from OrCAD, Allegro, Xpedition/Expedition, Altium (+ the BOM) and get a
+KiCad project with parts placed under their original annotations, matched
+footprints and connectivity preserved via net labels. All four formats pass
+kicad-cli round-trip verification — see its `DESIGN.md`.
+
+## Roadmap / ideas
+
+- Map BOM designators onto placed symbols to pre-populate the schematic
+- Optional "update library" pass that checks for newer part revisions
+- Per-part exclusion flags for BOM-fitted vs personally selected alternatives
 
 ## Acknowledgements
 
