@@ -135,8 +135,13 @@ python3 core.py --bom BOM_xxx.csv --name MyProject --out ~/Documents/KiCad
 ## Notes
 
 - **Bundled dependencies** (`site-packages/`): `requests`, `pydantic` and
-  friends ship inside the package. The `pydantic_core` wheel targets
+  friends ship inside the package. The `pydantic_core` wheels target
   CPython 3.11, which is what KiCad 10 bundles (minimum tested version).
+  Binaries for Linux (AppImage), Windows (win_amd64 — works on any Intel or
+  AMD 64-bit CPU) and macOS (darwin; an Intel-Mac binary is bundled — on
+  Apple-silicon Macs the plugin auto-fetches the matching wheel on first
+  run via KiCad's bundled pip) are inside the zip, so the plugin installs
+  on any OS as-is.
   The conversion layer is a vendored copy of
   [easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py) (MIT),
   patched for a current User-Agent, request patience and AppImage workarounds.

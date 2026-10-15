@@ -12,6 +12,11 @@ DEFAULT_PARENT = os.path.join(os.path.expanduser("~"), "Documents", "KiCad")
 SITE_PKG = os.path.join(PLUGIN_DIR, "site-packages")
 
 WILDCARD = "EasyEDA BOM (*.csv)|*.csv;*.CSV|All files (*.*)|*.*"
+NETLIST_WILDCARD = (
+    "Netlist / schematic export (*.net;*.cir;*.xml;*.Net)|"
+    "*.net;*.cir;*.xml;*.Net|"
+    "All files (*.*)|*.*"
+)
 
 
 def default_project_name(bom_path: str) -> str:
@@ -91,22 +96,32 @@ def _pip_install_cmd(python: str, mods: list) -> list:
 
     cmd = [python, "-m", "pip", "install", "--no-warn-script-location",
            "--upgrade", "--target", SITE_PKG, "--only-binary=:all:"]
-    if platform.system() == "Linux":
+    system = platform.system()
+    if system == "Linux":
         # target KiCad's bundled CPython 3.11 ABI regardless of host python
         cmd += ["--implementation", "cp", "--python-version", "3.11",
                 "--abi", "cp311"]
         for plat in ("manylinux2014_x86_64", "manylinux_2_28_x86_64",
                      "manylinux_2_17_x86_64"):
             cmd += ["--platform", plat]
+    elif system == "Windows":
+        cmd += ["--implementation", "cp", "--python-version", "3.11",
+                "--abi", "cp311"]
+        for plat in ("windows_amd64", "win_amd64"):
+            cmd += ["--platform", plat]
     return cmd + mods
 
 
 def _host_pips() -> list:
+    import platform as _platform
     import shutil as _shutil
 
     out = []
     seen = set()
-    cands = [sys.executable, "python3", "python3.11"]
+    if _platform.system() == "Windows":
+        cands = [sys.executable, "python", "py", "python3"]
+    else:
+        cands = [sys.executable, "python3", "python3.11"]
     for c in cands:
         path = c if os.path.isabs(c) else (_shutil.which(c) or "")
         if not path or path in seen:
@@ -253,6 +268,27 @@ def _pump_events():
         pass
 
 
+def compute_project_dir(parent: str, project_name: str):
+    """Same selection rule core uses: when the parent itself contains
+    `<name>.kicad_pro`, the parent IS the project folder."""
+    import os as _os
+
+    parent = _os.path.abspath(parent)
+    direct = _os.path.join(parent, project_name + ".kicad_pro")
+    if _os.path.isfile(direct):
+        return parent
+    return _os.path.join(parent, project_name)
+
+
+def _find_kicad_cli_safe():
+    try:
+        from core import _find_kicad_cli
+
+        return _find_kicad_cli()
+    except Exception:
+        return None
+
+
 def run_dialog(parent=None, project_name="", project_dir=""):
     import wx
 
@@ -327,6 +363,30 @@ try:
                 style=wx.DIRP_USE_TEXTCTRL,
             )
             grid.Add(self.dir_picker, 1, wx.EXPAND)
+
+            grid.Add(
+                wx.StaticText(panel,
+                              label="Netlist / schematic export\n(optional, for annotation migration):"),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
+            self.net_picker = wx.FilePickerCtrl(
+                panel, wildcard=NETLIST_WILDCARD,
+                style=wx.FLP_USE_TEXTCTRL | wx.FLP_OPEN,
+            )
+            grid.Add(self.net_picker, 1, wx.EXPAND)
+            netlist_hint = wx.StaticText(
+                panel,
+                label=(
+                    "BOM only  -> symbols + footprints.\n"
+                    "BOM + netlist -> also places parts in the schematic with\n"
+                    "their annotations (OrCAD .net, Allegro 3rd-party,\n"
+                    "Xpedition/Allegro IPC-2581 .xml, Altium .Net)."
+                ),
+            )
+            netlist_hint.SetFont(wx.Font(8, wx.FONTFAMILY_DEFAULT,
+                                         wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+            vbox.Add(netlist_hint, 0, wx.LEFT | wx.RIGHT, 10)
             vbox.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
             if has_project:
@@ -435,6 +495,8 @@ try:
             project_name = self.name_ctrl.GetValue().strip()
             bom = self.bom_picker.GetPath()
             parent = self.dir_picker.GetPath()
+            netlist_path = self.net_picker.GetPath() if \
+                hasattr(self, "net_picker") else ""
             if not project_name:
                 wx.MessageBox(
                     "Enter a project name.", "BOM2Lib", wx.OK | wx.ICON_WARNING
@@ -454,6 +516,12 @@ try:
                     wx.OK | wx.ICON_WARNING,
                 )
                 return
+            if netlist_path and not os.path.isfile(netlist_path):
+                wx.MessageBox(
+                    "The netlist/schematic export file does not exist.",
+                    "BOM2Lib", wx.OK | wx.ICON_WARNING,
+                )
+                return
 
             self.import_btn.Disable()
             self.stop_btn.Enable()
@@ -467,6 +535,7 @@ try:
                 bom, project_name, parent,
                 self.chk_3d.GetValue(), self.chk_step.GetValue(),
                 self.chk_overwrite.GetValue(), self.chk_skeleton.GetValue(),
+                netlist_path,
             )
             self._thread = threading.Thread(
                 target=self._build_worker, args=args, daemon=True
@@ -474,7 +543,7 @@ try:
             self._thread.start()
 
         def _build_worker(self, bom, project_name, parent, with_3d, with_step,
-                          overwrite, skeleton):
+                          overwrite, skeleton, netlist_path=""):
             """Runs in a background thread; all GUI interaction goes through
             wx.CallAfter so updates paint reliably from KiCad's event loop."""
             import traceback as _tb
@@ -496,12 +565,48 @@ try:
                     progress_cb=progress_cb,
                     cancel_event=self._cancel,
                 )
+                # optional 2.0 step: migrate the netlist into the schematic
+                # with matched symbols/footprints per annotation
+                if netlist_path and not self._cancel.is_set():
+                    if compute_project_dir(parent, project_name) is not None:
+                        pass
+                    wx.CallAfter(self.log, "--- Migrating netlist to schematic...")
+                    migrate_summary = self._migrate_worker(
+                        netlist_path, project_name, parent, log_cb
+                    )
+                    summary["migration"] = migrate_summary
                 wx.CallAfter(self._build_done, summary, None)
             except Exception as e:
                 wx.CallAfter(self._build_done, None, e)
                 logging.exception("BOM2Lib worker failed")
             finally:
                 wx.CallAfter(self._worker_finished)
+
+        def _migrate_worker(self, netlist_path, project_name, parent, log_cb):
+            """Runs in the worker thread after the library build; returns a
+            small summary dict for the final dialog."""
+            sys.path.insert(0, PLUGIN_DIR)
+            try:
+                from sch_import import migrate as sch_migrate
+
+                if not parent or not project_name:
+                    log_cb("migration skipped: project not resolved")
+                    return {"ok": False, "error": "project not resolved"}
+                # resolve the actual project dir the library was written to
+                proj_dir = compute_project_dir(parent, project_name)
+                kcli = _find_kicad_cli_safe()
+                result = sch_migrate.migrate(
+                    netlist_path=netlist_path,
+                    project_dir=proj_dir,
+                    project_name=project_name,
+                    log_cb=lambda m: log_cb("  " + m),
+                    kicad_cli=kcli,
+                )
+                return result
+            except Exception as e:
+                logging.exception("schematic migration failed")
+                log_cb(f"SCHEMATIC MIGRATION ERROR: {e}")
+                return {"ok": False, "error": str(e)[:300]}
 
         def _worker_finished(self):
             self._running = False
@@ -544,6 +649,25 @@ try:
                 msg += "\n\nFailed parts:\n" + "\n".join(
                     f"  {lcsc}: {err}" for lcsc, err in failed[:20]
                 )
+            mig = summary.get("migration")
+            if mig:
+                if mig.get("ok"):
+                    msg += (
+                        "\n\nSchematic migrated:\n"
+                        f"{mig.get('target')}\n"
+                        f"Parts placed: {mig.get('parts_placed')}, "
+                        f"nets: {mig.get('nets_connected')}"
+                    )
+                    v = mig.get("verify")
+                    if v:
+                        msg += (
+                            f"\nVerification: {v.get('status')}"
+                            + (f" ({v.get('detail', '')[:120]})"
+                               if v.get("status") == "error" else "")
+                        )
+                else:
+                    msg += ("\n\nSchematic migration failed: "
+                            + str(mig.get('error', ''))[:200])
             msg += (
                 "\n\nTip: fully close and reopen this project (or restart "
                 "KiCad) so its editors pick up the freshly written "

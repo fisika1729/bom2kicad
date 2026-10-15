@@ -228,6 +228,8 @@ class LibBuilder:
 
         self._api = None
         self._cache: Dict[str, Dict] = {}
+        # optional BOM rows indexed by lcsc id (set by build_libraries)
+        self.bom_map: Dict[str, object] = {}
 
     # -- logging helpers -----------------------------------------------------
     def log(self, msg: str) -> None:
@@ -264,13 +266,22 @@ class LibBuilder:
 
     @staticmethod
     def _host_python() -> Optional[str]:
+        import platform as _platform
         import shutil as _shutil
 
-        cands = ["python3", "python3.11", "python"]
+        if _platform.system() == "Windows":
+            cands = ["python", "python3", "python.exe"]
+        else:
+            cands = ["python3", "python3.11", "python"]
+        # also consider KiCad's own bundled python first - on Windows/macOS
+        # it ships WITH pip and ssl (unlike the Linux AppImage)
+        cands = [sys.executable] + [c for c in cands]
+        seen = set()
         for c in cands:
-            p = _shutil.which(c)
-            if not p:
+            p = c if os.path.isabs(c) else (_shutil.which(c) or "")
+            if not p or p in seen:
                 continue
+            seen.add(p)
             try:
                 r = subprocess.run(
                     [p, "-c", "import ssl, requests; print('ok')"],
@@ -423,8 +434,18 @@ class LibBuilder:
     # -- part import ----------------------------------------------------------
     def add_part(self, lcsc_id: str) -> str:
         """Import one LCSC part into the project libraries. Returns status."""
+        def _standard_fp_cached(lcsc_id: str):
+            """When a cached entry points at a standard KiCad lib, treat as
+            done (no footprint file is generated for standard packages)."""
+            cached = self._cache.get(lcsc_id)
+            if cached and cached.get("std"):
+                return True
+            return False
+
         if not self.overwrite and lcsc_id in self._cache:
             cached = self._cache[lcsc_id]
+            if _standard_fp_cached(lcsc_id):
+                return "cached"
             if os.path.isfile(os.path.join(self.pretty_dir, cached["fp"] + ".kicad_mod")):
                 return "cached"
 
@@ -449,7 +470,20 @@ class LibBuilder:
 
         status = ""
 
-        # ---- symbol ----
+        # ---- standard-library reuse check -------------------------------
+        import standard_libs as _sl
+
+        row = self.bom_map.get(lcsc_id)
+        cls, pkg = _sl.classify(
+            row.footprint_name if row else "",
+            row.footprint_name if row else "",
+            getattr(row, "mpn", "") if row else "",
+        )
+        std_fp = _sl.standard_footprint_for(cls, pkg) if cls else None
+        # symbol-only reuse for generic passives (Device:R/C/L/D/LED)
+        std_sym = _sl.stock_symbol_for(cls) if cls else None
+
+        # ---- symbol (unless we reuse KiCad's Device symbol) -------------
         from easyeda2kicad.easyeda.easyeda_importer import EasyedaSymbolImporter
         from easyeda2kicad.kicad.export_kicad_symbol import ExporterSymbolKicad
         from easyeda2kicad.kicad.parameters_kicad_symbol import KicadVersion
@@ -463,26 +497,44 @@ class LibBuilder:
             symbol.info.name = symbol_name + "_" + lcsc_id
             symbol_name = symbol.info.name
 
-        exporter = ExporterSymbolKicad(
-            symbol=symbol, kicad_version=KicadVersion.v6
-        )
-        block = exporter.export(footprint_lib_name=self.project_name)
-
-        already_in_lib = self._symbol_in_lib(symbol_name)
-        if already_in_lib and not self.overwrite:
-            status = "exists"
+        if std_sym:
+            self.log(f"  symbol: standard {std_sym} (EasyEDA one skipped)")
         else:
-            self._append_symbol_to_lib(symbol_name, block)
-            status = "ok" if status == "" else status
+            exporter = ExporterSymbolKicad(
+                symbol=symbol, kicad_version=KicadVersion.v6
+            )
+            block = exporter.export(footprint_lib_name=self.project_name)
 
-        self._symbol_blocks[symbol_name] = (block, lcsc_id)
+            already_in_lib = self._symbol_in_lib(symbol_name)
+            if already_in_lib and not self.overwrite:
+                status = "exists"
+            else:
+                self._append_symbol_to_lib(symbol_name, block)
+                status = "ok" if status == "" else status
 
-        # ---- footprint ----
+            self._symbol_blocks[symbol_name] = (block, lcsc_id)
+
+        # ---- footprint (standard KiCad footprint beats generated) -------
         from easyeda2kicad.easyeda.easyeda_importer import EasyedaFootprintImporter
         from easyeda2kicad.kicad.export_kicad_footprint import ExporterFootprintKicad
 
         footprint = EasyedaFootprintImporter(easyeda_cp_cad_data=cad_data).get_footprint()
         fp_name = footprint.info.name
+
+        if std_fp:
+            std_lib, std_name = std_fp
+            self._cache[lcsc_id] = {
+                "symbol": symbol_name if symbol_name else std_name,
+                "fp": f"{std_lib}:{std_name}",
+                "std": True,
+            }
+            self._save_cache()
+            self.log(
+                f"  footprint: standard {std_lib}:{std_name} "
+                f"(EasyEDA '{fp_name}' skipped)"
+            )
+            return status if status else "ok"
+
         fp_path = os.path.join(self.pretty_dir, fp_name + ".kicad_mod")
         if os.path.isfile(fp_path) and not self.overwrite:
             self.log(f"  footprint {fp_name}.kicad_mod already exists, skipped")
@@ -492,7 +544,7 @@ class LibBuilder:
                 model_3d_path="${KIPRJMOD}/" + self.project_name + ".3dshapes",
             )
 
-        # ---- 3D model ----
+        # ---- 3D model (std footprints ship their own 3D) -----------------
         if self.with_3d:
             self._add_3d_model(cad_data, fp_name)
 
@@ -760,22 +812,66 @@ class LibBuilder:
 
 
 def _find_kicad_cli() -> Optional[str]:
-    candidates = [shutil.which("kicad-cli")]
+    import platform as _platform
+    import glob as _glob
+    import sys
+
+    cli_name = (
+        "kicad-cli.exe" if _platform.system() == "Windows" else "kicad-cli"
+    )
+    candidates = [shutil.which(cli_name)]
+
+    # KiCad ships its bundled python next to the app binaries; on Windows and
+    # macOS sys.executable inside the plugin = that bundled python, so walk
+    # the app bundle/program tree looking for kicad-cli
+    try:
+        app_bin = os.path.dirname(os.path.abspath(sys.executable))
+    except Exception:
+        app_bin = ""
+    if app_bin:
+        candidates.append(os.path.join(app_bin, cli_name))
+        candidates.append(os.path.join(os.path.dirname(app_bin), "bin", cli_name))
+        cur = os.path.dirname(app_bin)
+        for _ in range(6):
+            candidates.append(os.path.join(cur, cli_name))
+            candidates.append(os.path.join(cur, "MacOS", cli_name))
+            candidates.append(os.path.join(cur, "bin", cli_name))
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+
     appdir = os.environ.get("APPDIR")
     if appdir:
         candidates.append(os.path.join(appdir, "usr", "bin", "kicad-cli"))
-    # KiCad AppImages extract to /tmp/.mount_* when run with --appimage-extract
-    import glob as _glob
+        candidates.append(os.path.join(appdir, "bin", cli_name))
 
-    for pattern in (
-        "/tmp/.mount_kicad*/usr/bin/kicad-cli",
-        "/tmp/.mount_*/usr/bin/kicad-cli",
-    ):
-        candidates.extend(sorted(_glob.glob(pattern)))
+    if _platform.system() == "Windows":
+        for pattern in (
+            os.path.join(os.environ.get("ProgramFiles", r"C:\\Program Files"),
+                         "KiCad", "*", "bin", cli_name),
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)"),
+                         "KiCad", "*", "bin", cli_name),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                         "KiCad", "*", "bin", cli_name),
+        ):
+            candidates.extend(sorted(_glob.glob(pattern)))
+    else:
+        # KiCad AppImages extract to /tmp/.mount_* when running legitimately
+        for pattern in (
+            "/tmp/.mount_kicad*/usr/bin/kicad-cli",
+            "/tmp/.mount_*/usr/bin/kicad-cli",
+        ):
+            candidates.extend(sorted(_glob.glob(pattern)))
+
     for c in candidates:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c
-    # last resort: extract a KiCad AppImage found in ~/Downloads (cached)
+
+    if _platform.system() != "Linux":
+        return None
+
+    # last resort on Linux: extract a KiCad AppImage found in ~/Downloads
     dl = os.path.join(os.path.expanduser("~"), "Downloads")
     for appimage in sorted(_glob.glob(os.path.join(dl, "kicad-*.AppImage"))):
         squash = appimage + ".squashfs-root"
@@ -959,6 +1055,8 @@ def build_libraries(
         log_cb=log_cb,
         progress_cb=progress_cb,
     )
+    # BOM rows by lcsc id for standard-library reuse decisions
+    builder.bom_map = dict(unique)
     builder.log(f"Project directory: {builder.project_dir}")
     builder.log(f"Parts in BOM: {len(parts)} rows, {len(unique)} unique LCSC parts")
     builder.create_tree()

@@ -29,9 +29,9 @@
             "status": "stable",
             "kicad_version": "10.0",
             "download_url": "https://github.com/fisika1729/bom2kicad/releases/download/v1.0.1/bom2kicad-1.0.1-pcm.zip",
-            "download_sha256": "c74fccd3989192495696b3cd58dca5adbd1397eb047c2bb356135d55aa520309",
-            "download_size": 3358574,
-            "install_size": 9477077
+            "download_sha256": "d05307446887fa3bb205b75e449e461ff5acab4389b0f97dcefe0fb88fe36910",
+            "download_size": 7230086,
+            "install_size": 19397579
         }
     ]
 }
